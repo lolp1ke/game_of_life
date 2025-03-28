@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/life"]
+resolver = "2"
+
+
+[workspace.dependencies]
+life = { path = "crates/life" }
