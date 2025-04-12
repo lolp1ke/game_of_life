@@ -4,4 +4,12 @@ resolver = "2"
 
 
 [workspace.dependencies]
+# Internal crates
 life = { path = "crates/life" }
+
+# External packages
+anyhow = { version = "1.0.97" }
+tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread"] }
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+futures = { version = "0.3.31" }
+futures-timer = { version = "3.0.3" }
