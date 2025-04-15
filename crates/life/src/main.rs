@@ -1,6 +1,7 @@
 use std::{
-  collections::HashMap,
-  hash::Hash,
+  cell::{RefCell, RefMut},
+  collections::{HashMap, VecDeque},
+  fmt::Debug,
   io::{self, Write},
   time,
 };
@@ -13,403 +14,387 @@ use futures::{FutureExt, StreamExt, future::Fuse, select, stream::Next};
 use futures_timer::Delay;
 
 
-const CHUNK_SIZE: usize = 32;
+const CHUNK_SIZE: usize = 8;
 const CHUNK_SIZE_SQR: usize = CHUNK_SIZE * CHUNK_SIZE;
 const CHUNK_SIZE_I32: i32 = CHUNK_SIZE as i32;
-const CHUNK_SIZE_SQR_I32: i32 = CHUNK_SIZE_SQR as i32;
 
-const CHUNKS_TO_DRAW: i32 = 1;
+const CHUNKS_TO_DRAW: i32 = 5;
 
-const SPEED: u64 = 200;
+const SPEED: u64 = 50;
 
-const DIRECTIONS: [i32; 8] = [
-  -CHUNK_SIZE_I32 - 1,
-  -CHUNK_SIZE_I32,
-  -CHUNK_SIZE_I32 + 1,
-  -1,
-  1,
-  CHUNK_SIZE_I32 - 1,
-  CHUNK_SIZE_I32,
-  CHUNK_SIZE_I32 + 1,
+const OFFSETS: [(i32, i32); 8] = [
+  (-1, -1),
+  (0, -1),
+  (1, -1),
+  (-1, 0),
+  (1, 0),
+  (-1, 1),
+  (0, 1),
+  (1, 1),
 ];
 
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct Pos(i32, i32);
-impl Pos {
-  const EMPTY: Self = Self(i32::MAX, i32::MAX);
+#[derive(Debug)]
+enum Action {
+  NewChunkAt { x: i32, y: i32 },
+
+  CheckCellAt { x: i32, y: i32, idx: usize },
+  CheckChunkAt { x: i32, y: i32 },
+
+  MoveLeft,
+  MoveRight,
+  MoveUp,
+  MoveDown,
+
+  ChangeMode,
 }
 
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Cell {
-  pos: Pos,
-  is_alive: bool,
+  is_alive: [bool; 2],
+
+  x: i32,
+  y: i32,
 }
-// impl Cell {}
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Chunk {
-  pos: Pos,
   cells: [Cell; CHUNK_SIZE_SQR],
+
+  x: i32,
+  y: i32,
 }
 impl Chunk {
-  fn new_dead(pos: Pos) -> Self {
+  fn new(x: i32, y: i32) -> Self {
     return Self {
-      pos,
-      cells: core::array::from_fn(|i: usize| Cell {
-        pos: Pos((i % CHUNK_SIZE) as i32, (i / CHUNK_SIZE) as i32),
-        is_alive: false,
+      cells: std::array::from_fn(|i: usize| {
+        let i = i as i32;
+        return Cell {
+          is_alive: [false, false],
+          x: i % CHUNK_SIZE_I32,
+          y: i / CHUNK_SIZE_I32,
+        };
       }),
+      x,
+      y,
     };
   }
 
-  fn is_alive_at(&self, cell_idx: usize) -> bool {
-    debug_assert!(cell_idx < CHUNK_SIZE_SQR);
-    return self.cells[cell_idx].is_alive;
-  }
-
-  fn is_dead(&self) -> bool {
-    for cell in self.cells.iter() {
-      if cell.is_alive {
-        return false;
-      };
-    }
-
-    return true;
-  }
-
-  fn within_viewport(&self, v_pos: Pos) -> bool {
-    return (v_pos.0..(v_pos.0 + CHUNKS_TO_DRAW)).contains(&self.pos.0)
-      && (v_pos.1..(v_pos.1 + CHUNKS_TO_DRAW)).contains(&self.pos.1);
+  fn within_viewport(&self, vx: i32, vy: i32) -> bool {
+    return (vx..(vx + CHUNKS_TO_DRAW)).contains(&self.x)
+      && (vy..(vy + CHUNKS_TO_DRAW)).contains(&self.y);
   }
 }
 #[derive(Debug)]
-struct Game {
-  chunks: HashMap<Pos, Chunk>,
-  generation: u128,
+struct Universe {
+  chunks: HashMap<(i32, i32), Chunk>,
 
-  v_pos: Pos,
-  stdout: io::Stdout,
+  actions: RefCell<VecDeque<Action>>,
 
   auto: bool,
+  generation: usize,
+
+  render: RefCell<Box<dyn Render>>,
 }
-impl Game {
-  fn new() -> Self {
-    let stdout: io::Stdout = io::stdout();
-    let mut chunks: HashMap<Pos, Chunk> = HashMap::new();
-    for i in 0..CHUNKS_TO_DRAW {
-      for j in 0..CHUNKS_TO_DRAW {
-        let pos: Pos = Pos(j, i);
-        chunks.insert(pos.clone(), Chunk::new_dead(pos));
-      }
-    }
-    // let chunks: HashMap<Pos, Chunk> = RefCell::new(chunks);
+impl Universe {
+  fn new() -> Result<Self> {
+    return Ok(Self {
+      chunks: HashMap::new(),
 
+      actions: RefCell::new(VecDeque::new()),
 
-    return Self {
-      chunks,
+      auto: false,
       generation: 0,
 
-      v_pos: Pos(0, 0),
-      stdout,
-
-      auto: true,
-    };
+      render: RefCell::new(Box::new(TermRender::new()?)),
+    });
   }
 
+  fn render<'a>(&'a self) -> RefMut<'a, Box<dyn Render>> {
+    return self.render.borrow_mut();
+  }
 
-  fn draw_frame(&mut self) -> Result<()> {
-    self
-      .stdout
-      .queue(terminal::Clear(terminal::ClearType::All))?;
-
-
-    for (chunk_pos, chunk) in self.chunks.iter() {
-      if !chunk.within_viewport(self.v_pos.clone()) {
-        continue;
-      };
-
-      for cell in chunk.cells.iter() {
-        let Pos(local_x, local_y) = cell.pos;
-        let global_x = local_x + CHUNK_SIZE_I32 * chunk_pos.0;
-        let global_y = local_y + CHUNK_SIZE_I32 * chunk_pos.1;
-        let (screen_x, screen_y) = (
-          global_x - CHUNK_SIZE_I32 * self.v_pos.0,
-          global_y - CHUNK_SIZE_I32 * self.v_pos.1,
-        );
-        let (screen_x, screen_y) = (screen_x as u16, screen_y as u16);
-
-        self
-          .stdout
-          .queue(cursor::MoveTo(screen_x, screen_y))?
-          .queue(if cell.is_alive {
-            style::Print("@")
-          } else {
-            style::Print("*")
-          })?;
-      }
+  fn step(&mut self) -> Result<()> {
+    for (&(x, y), _) in self.chunks.iter() {
+      self
+        .actions
+        .borrow_mut()
+        .push_back(Action::CheckChunkAt { x, y });
     }
 
-
+    self.execute_actions()?;
+    self.render().draw_frame(&self.chunks)?;
+    self.generation += 1;
     return Ok(());
   }
+  fn check_neighbours(&self, cx: i32, cy: i32, cell: &Cell) -> u32 {
+    let global_x = cx * CHUNK_SIZE_I32 + cell.x;
+    let global_y = cy * CHUNK_SIZE_I32 + cell.y;
+    let mut count = 0;
+    for &(dx, dy) in OFFSETS.iter() {
+      let neighbour_global_x = global_x + dx;
+      let neighbour_global_y = global_y + dy;
+
+      let neighbour_cx = if neighbour_global_x >= 0 {
+        neighbour_global_x / CHUNK_SIZE_I32
+      } else {
+        (neighbour_global_x - (CHUNK_SIZE_I32 - 1)) / CHUNK_SIZE_I32
+      };
+      let neighbour_cy = if neighbour_global_y >= 0 {
+        neighbour_global_y / CHUNK_SIZE_I32
+      } else {
+        (neighbour_global_y - (CHUNK_SIZE_I32 - 1)) / CHUNK_SIZE_I32
+      };
+
+      let neigbhour_local_x =
+        neighbour_global_x - neighbour_cx * CHUNK_SIZE_I32;
+      let neighbour_local_y =
+        neighbour_global_y - neighbour_cy * CHUNK_SIZE_I32;
+
+      if let Some(neighbor_chunk) =
+        self.chunks.get(&(neighbour_cx, neighbour_cy))
+      {
+        let n_idx =
+          (neighbour_local_y * CHUNK_SIZE_I32 + neigbhour_local_x) as usize;
+        if neighbor_chunk.cells[n_idx].is_alive[0] {
+          count += 1;
+        }
+      };
+    }
+    return count;
+  }
+
   async fn run(&mut self) -> Result<()> {
-    terminal::enable_raw_mode()?;
-    self
-      .stdout
-      .execute(terminal::EnterAlternateScreen)?
-      .execute(terminal::Clear(terminal::ClearType::All))?;
-
-
     let mut reader: event::EventStream = event::EventStream::new();
+
+
+    self.render().draw_frame(&self.chunks)?;
     loop {
       let mut delay: Fuse<Delay> =
-        futures_timer::Delay::new(time::Duration::from_millis(SPEED)).fuse();
+        futures_timer::Delay::new(time::Duration::from_millis(1000 / SPEED))
+          .fuse();
       let mut event: Fuse<Next<'_, event::EventStream>> = reader.next().fuse();
 
       select! {
         _ = delay => {
           if self.auto {
             self.step()?;
-            self.draw_frame()?;
-
-            self.stdout.flush()?;
           };
         }
 
         _event = event => {
           match _event {
-            Some(Ok(event)) => {
-              match event {
-                event::Event::Key(event::KeyEvent {code, kind, ..}) if kind == event::KeyEventKind::Release => {
-                  match code {
-                    event::KeyCode::Char(ch) => {
-                      match ch {
-                        'q' => break,
+            Some(Ok(event)) if self.handle_event(event.clone()).unwrap_or_else(|err| {
+              dbg!("Err: {}", err);
+              return true;
+            }) => break,
 
-                        'l' => self.v_pos.0 += 1,
-                        'h' => self.v_pos.0 -= 1,
-                        'k' => self.v_pos.1 -= 1,
-                        'j' => self.v_pos.1 += 1,
-
-                        ' ' => self.auto = !self.auto,
-
-                        _ => {}
-                      };
-                    }
-                    event::KeyCode::Enter if !self.auto => {
-                      self.step()?;
-                      self.draw_frame()?;
-
-                      self.stdout.flush()?;
-                    }
-
-                    _ => {}
-                  };
-                }
-
-                _ => {}
-              };
-            }
+            Some(Err(err)) => panic!("Err: {}", err),
             _ => {}
           };
         }
-      };
-    }
-
-    terminal::disable_raw_mode()?;
-    self.stdout.execute(terminal::LeaveAlternateScreen)?;
-    return Ok(());
-  }
-
-  fn step(&mut self) -> Result<()> {
-    for (chunk_pos, chunk) in self.chunks.clone().iter() {
-      for (cell_idx, _) in chunk.cells.iter().enumerate() {
-        if chunk.is_dead() && !chunk.within_viewport(self.v_pos.clone()) {
-          continue;
-        };
-        let neighbours: u32 = self.check_neighbours(&chunk, cell_idx);
-
-        if neighbours == 3 {
-          self.get_cell_mut(&chunk_pos, cell_idx).is_alive = true;
-        } else if neighbours < 2 || neighbours > 3 {
-          self.get_cell_mut(&chunk_pos, cell_idx).is_alive = false;
-        };
       }
     }
 
-    self.generation += 1;
-    println!("{} - {}:{}", self.generation, self.v_pos.0, self.v_pos.1);
+
     return Ok(());
   }
+  fn handle_event(&mut self, event: event::Event) -> Result<bool> {
+    match event {
+      event::Event::Key(event::KeyEvent { code, kind, .. })
+        if kind == event::KeyEventKind::Press =>
+      {
+        match code {
+          event::KeyCode::Char(ch) => {
+            match ch {
+              'q' => return Ok(true),
 
-  fn get_cell_mut(&mut self, chunk_pos: &Pos, cell_idx: usize) -> &mut Cell {
-    debug_assert!((0..CHUNK_SIZE_SQR).contains(&cell_idx));
-    if let Some(chunk) = self.chunks.get_mut(chunk_pos) {
-      return &mut chunk.cells[cell_idx];
+              'h' => self.actions.borrow_mut().push_back(Action::MoveLeft),
+              'l' => self.actions.borrow_mut().push_back(Action::MoveRight),
+              'k' => self.actions.borrow_mut().push_back(Action::MoveUp),
+              'j' => self.actions.borrow_mut().push_back(Action::MoveDown),
+
+              'n' => self.step()?,
+
+              ' ' => self.actions.borrow_mut().push_back(Action::ChangeMode),
+
+              _ => {}
+            };
+          }
+
+          _ => {}
+        };
+      }
+
+      _ => {}
     };
 
-    panic!("Invalid chunk position");
+    return Ok(false);
   }
+  fn execute_actions(&mut self) -> Result<()> {
+    use Action::*;
+    let mut actions = self.actions.borrow_mut();
 
-  fn check_neighbours(
-    &mut self,
-    current_chunk: &Chunk,
-    cell_idx: usize,
-  ) -> u32 {
-    let mut neighbours: u32 = 0;
+    while let Some(action) = actions.pop_front() {
+      match action {
+        NewChunkAt { x, y } => {
+          self.chunks.insert((x, y), Chunk::new(x, y));
+          actions.push_front(CheckChunkAt { x, y });
+        }
 
-    for direction in DIRECTIONS {
-      match cell_idx {
-        // top left corner
-        // _ if cell_idx == 0 => {
-        //   let pos: Pos = Pos(current_chunk.pos.0 - 1, current_chunk.pos.1);
-        //   if let Some(chunk) = self.chunks.get(&pos) {
-        //     neighbours += self.check_adjacent_neighbour(chunk, &[
-        //       CHUNK_SIZE - 1,
-        //       CHUNK_SIZE * 2 - 1,
-        //     ]);
-        //   } else {
-        //     self.chunks.insert(pos.clone(), Chunk::new_dead(pos));
-        //   };
-        //
-        //   let pos: Pos = Pos(current_chunk.pos.0 - 1, current_chunk.pos.1 + 1);
-        //   if let Some(chunk) = self.chunks.get(&pos) {
-        //     neighbours +=
-        //       self.check_adjacent_neighbour(chunk, &[CHUNK_SIZE_SQR - 1]);
-        //   } else {
-        //     self.chunks.insert(pos.clone(), Chunk::new_dead(pos));
-        //   };
-        //
-        //   let pos: Pos = Pos(current_chunk.pos.0, current_chunk.pos.1 + 1);
-        //   if let Some(chunk) = self.chunks.get(&pos) {
-        //     neighbours += self.check_adjacent_neighbour(chunk, &[
-        //       CHUNK_SIZE_SQR - (CHUNK_SIZE - 1),
-        //       CHUNK_SIZE_SQR - (CHUNK_SIZE - 2),
-        //     ]);
-        //   } else {
-        //     self.chunks.insert(pos.clone(), Chunk::new_dead(pos));
-        //   };
-        // }
-        // // top right corner
-        // _ if cell_idx == CHUNK_SIZE - 1 => {
-        //   let pos: Pos = Pos(current_chunk.pos.0, current_chunk.pos.1 + 1);
-        //   if let Some(chunk) = self.chunks.get(&pos) {
-        //     neighbours += self.check_adjacent_neighbour(chunk, &[
-        //       CHUNK_SIZE_SQR,
-        //       CHUNK_SIZE_SQR - 1,
-        //     ]);
-        //   } else {
-        //     self.chunks.insert(pos.clone(), Chunk::new_dead(pos));
-        //   };
-        //
-        //   let pos: Pos = Pos(current_chunk.pos.0 + 1, current_chunk.pos.1 + 1);
-        //   if let Some(chunk) = self.chunks.get(&pos) {
-        //     neighbours += self.check_adjacent_neighbour(chunk, &[
-        //       CHUNK_SIZE_SQR - (CHUNK_SIZE - 1),
-        //     ]);
-        //   } else {
-        //     self.chunks.insert(pos.clone(), Chunk::new_dead(pos));
-        //   };
-        //
-        //   let pos: Pos = Pos(current_chunk.pos.0 + 1, current_chunk.pos.1);
-        //   if let Some(chunk) = self.chunks.get(&pos) {
-        //     neighbours +=
-        //       self.check_adjacent_neighbour(chunk, &[0, CHUNK_SIZE]);
-        //   } else {
-        //     self.chunks.insert(pos.clone(), Chunk::new_dead(pos));
-        //   };
-        // }
-        // // bottom left corner
-        // _ if cell_idx == CHUNK_SIZE_SQR - (CHUNK_SIZE - 1) => {
-        //   let pos: Pos = Pos(current_chunk.pos.0 - 1, current_chunk.pos.1);
-        //   if let Some(chunk) = self.chunks.get(&pos) {
-        //     neighbours += self.check_adjacent_neighbour(chunk, &[
-        //       CHUNK_SIZE - 1,
-        //       CHUNK_SIZE * 2 - 1,
-        //     ]);
-        //   } else {
-        //     self.chunks.insert(pos.clone(), Chunk::new_dead(pos));
-        //   };
-        //
-        //   let pos: Pos = Pos(current_chunk.pos.0 - 1, current_chunk.pos.1 + 1);
-        //   if let Some(chunk) = self.chunks.get(&pos) {
-        //     neighbours +=
-        //       self.check_adjacent_neighbour(chunk, &[CHUNK_SIZE_SQR - 1]);
-        //   } else {
-        //     self.chunks.insert(pos.clone(), Chunk::new_dead(pos));
-        //   };
-        //
-        //   let pos: Pos = Pos(current_chunk.pos.0, current_chunk.pos.1 + 1);
-        //   if let Some(chunk) = self.chunks.get(&pos) {
-        //     neighbours += self.check_adjacent_neighbour(chunk, &[
-        //       CHUNK_SIZE_SQR - (CHUNK_SIZE - 1),
-        //       CHUNK_SIZE_SQR - (CHUNK_SIZE - 2),
-        //     ]);
-        //   } else {
-        //     self.chunks.insert(pos.clone(), Chunk::new_dead(pos));
-        //   };
-        // }
-        _ => {}
+        CheckChunkAt { x, y } => {
+          if let Some(chunk) = self.chunks.get_mut(&(x, y)) {
+            for (cell_idx, _) in chunk.cells.iter_mut().enumerate() {
+              actions.push_back(CheckCellAt {
+                x,
+                y,
+                idx: cell_idx,
+              });
+            }
+          } else {
+            actions.push_front(Action::NewChunkAt { x, y });
+          };
+        }
+        CheckCellAt { x, y, idx } => {
+          if let Some(chunk) = self.chunks.get(&(x, y)) {
+            if chunk.cells[idx].is_alive[0] {
+              for &(dx, dy) in OFFSETS.iter() {
+                if self.chunks.get(&(x + dx, y + dy)).is_none() {
+                  actions.push_front(NewChunkAt {
+                    x: x + dx,
+                    y: y + dy,
+                  });
+                };
+              }
+            };
+
+            let neighbours = self.check_neighbours(x, y, &chunk.cells[idx]);
+            if neighbours < 2 || neighbours > 3 {
+              self.chunks.get_mut(&(x, y)).unwrap().cells[idx].is_alive[1] =
+                false;
+            } else if neighbours == 3 {
+              self.chunks.get_mut(&(x, y)).unwrap().cells[idx].is_alive[1] =
+                true;
+            } else if neighbours == 2 {
+              if self.chunks.get(&(x, y)).unwrap().cells[idx].is_alive[0] {
+                self.chunks.get_mut(&(x, y)).unwrap().cells[idx].is_alive[1] =
+                  true;
+              };
+            };
+          };
+        }
+
+        MoveLeft => self.render().increment_viewport(-1, 0),
+        MoveRight => self.render().increment_viewport(1, 0),
+        MoveUp => self.render().increment_viewport(0, -1),
+        MoveDown => self.render().increment_viewport(0, 1),
+
+        ChangeMode => self.auto = !self.auto,
       };
+    }
 
 
-      let idx = cell_idx as i32 + direction;
-      if idx < 0 || idx >= CHUNK_SIZE_SQR_I32 {
+    for (_, Chunk { cells, .. }) in self.chunks.iter_mut() {
+      for cell in cells.iter_mut() {
+        cell.is_alive[0] = cell.is_alive[1];
+        cell.is_alive[1] = false;
+      }
+    }
+    return Ok(());
+  }
+}
+trait Render: Debug {
+  fn draw_frame(&mut self, chunks: &HashMap<(i32, i32), Chunk>) -> Result<()>;
+  fn increment_viewport(&mut self, vx: i32, vy: i32);
+}
+#[derive(Debug)]
+struct TermRender {
+  stdout: io::Stdout,
+
+  vx: i32,
+  vy: i32,
+}
+impl Drop for TermRender {
+  fn drop(&mut self) {
+    let _ = self.stdout.execute(terminal::LeaveAlternateScreen);
+    let _ = terminal::disable_raw_mode();
+  }
+}
+impl TermRender {
+  const ASSETS: [char; 2] = ['@', '*'];
+
+  fn new() -> Result<Self> {
+    let mut stdout: io::Stdout = io::stdout();
+    terminal::enable_raw_mode()?;
+    stdout
+      .execute(terminal::EnterAlternateScreen)?
+      .execute(terminal::Clear(terminal::ClearType::All))?;
+
+    return Ok(Self {
+      stdout,
+
+      vx: 0,
+      vy: 0,
+    });
+  }
+}
+impl Render for TermRender {
+  fn draw_frame(&mut self, chunks: &HashMap<(i32, i32), Chunk>) -> Result<()> {
+    self
+      .stdout
+      .queue(terminal::Clear(terminal::ClearType::All))?;
+
+
+    for (&(x, y), chunk) in chunks.iter() {
+      if !chunk.within_viewport(self.vx, self.vy) {
         continue;
       };
 
-      if current_chunk.is_alive_at(idx as usize) {
-        neighbours += 1;
-      };
+      for (cell_idx, cell) in chunk.cells.iter().enumerate() {
+        let local_x = (cell_idx % CHUNK_SIZE) as i32;
+        let local_y = (cell_idx / CHUNK_SIZE) as i32;
+        let global_x = local_x + CHUNK_SIZE_I32 * x;
+        let global_y = local_y + CHUNK_SIZE_I32 * y;
+        let screen_x = (global_x - CHUNK_SIZE_I32 * self.vx) as u16;
+        let screen_y = (global_y - CHUNK_SIZE_I32 * self.vy) as u16;
+
+
+        self
+          .stdout
+          .queue(cursor::MoveTo(screen_x, screen_y))?
+          .queue(style::Print(if cell.is_alive[0] {
+            Self::ASSETS[0]
+          } else {
+            Self::ASSETS[1]
+          }))?;
+      }
     }
 
 
-    return neighbours;
+    self.stdout.flush()?;
+    return Ok(());
   }
-  fn check_adjacent_neighbour(
-    &self,
-    chunk: &Chunk,
-    cell_idxs: &[usize],
-  ) -> u32 {
-    let mut neighbours: u32 = 0;
-    for &cell_idx in cell_idxs {
-      if chunk.is_alive_at(cell_idx) {
-        neighbours += 1;
-      };
-    }
 
-    return neighbours;
+  fn increment_viewport(&mut self, vx: i32, vy: i32) {
+    self.vx += vx;
+    self.vy += vy;
   }
 }
 
 
 #[tokio::main]
 async fn main() -> Result<()> {
-  // let mut hm = HashMap::new();
-  let mut universe: Game = Game::new();
-  let mut chunk: Chunk = Chunk::new_dead(Pos(0, 0));
+  let mut universe = Universe::new()?;
 
-  chunk.cells[5 + 1 * CHUNK_SIZE].is_alive = true;
-  chunk.cells[6 + 2 * CHUNK_SIZE].is_alive = true;
-  chunk.cells[4 + 3 * CHUNK_SIZE].is_alive = true;
-  chunk.cells[5 + 3 * CHUNK_SIZE].is_alive = true;
-  chunk.cells[6 + 3 * CHUNK_SIZE].is_alive = true;
+  let mut chunk = Chunk::new(0, 0);
+  chunk.cells[1 + 1 * CHUNK_SIZE].is_alive[0] = true;
+  chunk.cells[3 + 2 * CHUNK_SIZE].is_alive[0] = true;
+  chunk.cells[1 + 3 * CHUNK_SIZE].is_alive[0] = true;
+  chunk.cells[2 + 3 * CHUNK_SIZE].is_alive[0] = true;
+  chunk.cells[3 + 3 * CHUNK_SIZE].is_alive[0] = true;
 
-  universe.chunks.insert(Pos(0, 0), chunk);
-  universe.auto = false;
+  universe.chunks.insert((0, 0), chunk);
+  universe.auto = true;
   universe.run().await?;
-
-  let a = universe
-    .chunks
-    .get(&Pos(0, 0))
-    .unwrap()
-    .cells
-    .iter()
-    .filter(|cell| cell.is_alive)
-    .collect::<Vec<&Cell>>();
-  dbg!(&a);
-
 
   return Ok(());
 }
